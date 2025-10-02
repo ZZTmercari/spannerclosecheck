@@ -1,0 +1,15 @@
+# Example golangci-lint configuration
+linters-settings:
+  spannerclosecheck:
+    # Currently only supports defer-only mode
+    # Checks that Close() methods are deferred
+
+linters:
+  enable:
+    - spannerclosecheck
+
+issues:
+  exclude-rules:
+    - path: _test\.go
+      linters:
+        - spannerclosecheck

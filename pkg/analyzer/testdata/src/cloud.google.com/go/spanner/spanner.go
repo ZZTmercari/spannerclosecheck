@@ -5,11 +5,17 @@ import "context"
 // Mock types for testing
 type Client struct{}
 
+func (c *Client) Close() {}
+
 type ReadOnlyTransaction struct{}
 
 func (t *ReadOnlyTransaction) Close() {}
 
 func (t *ReadOnlyTransaction) Query(ctx context.Context, stmt Statement) *RowIterator {
+	return &RowIterator{}
+}
+
+func (t *ReadOnlyTransaction) Read(ctx context.Context, table string, keys interface{}, columns []string) *RowIterator {
 	return &RowIterator{}
 }
 
@@ -44,4 +50,18 @@ type TimestampBound struct{}
 
 func StrongRead() TimestampBound {
 	return TimestampBound{}
+}
+
+type KeySet interface{}
+
+func KeySets(keys ...interface{}) KeySet {
+	return nil
+}
+
+func NewClient(ctx context.Context, database string, opts ...interface{}) (*Client, error) {
+	return &Client{}, nil
+}
+
+func (c *Client) Single() *ReadOnlyTransaction {
+	return &ReadOnlyTransaction{}
 }

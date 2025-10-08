@@ -31,7 +31,6 @@ jobs:
 
     - name: Run tests
       run: make test
-      continue-on-error: true  # Tests are under development
 
     - name: Run go vet
       run: go vet ./...

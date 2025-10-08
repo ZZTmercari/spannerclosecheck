@@ -1,7 +1,9 @@
 package analyzer
 
 import (
+	"go/token"
 	"go/types"
+	"strings"
 
 	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/analysis/passes/buildssa"
@@ -20,6 +22,7 @@ func deferOnlyAnalyzer(pass *analysis.Pass) (interface{}, error) {
 			registerType(pkg, "ReadOnlyTransaction", spannerTypes)
 			registerType(pkg, "BatchReadOnlyTransaction", spannerTypes)
 			registerType(pkg, "RowIterator", spannerTypes)
+			break
 		}
 	}
 
@@ -45,22 +48,71 @@ func registerType(pkg *ssa.Package, name string, spannerTypes map[*types.Named]s
 }
 
 func checkFunc(pass *analysis.Pass, fn *ssa.Function, spannerTypes map[*types.Named]string) {
-	// First pass: collect all variables with deferred Close/Stop calls
-	deferredVars := make(map[ssa.Value]bool)
+	if fn == nil {
+		return
+	}
 
+	// Skip generated files (e.g., .yo.go files)
+	if isGeneratedFile(pass, fn.Pos()) {
+		return
+	}
+
+	// Check all instructions for Spanner resource allocations
 	for _, block := range fn.Blocks {
 		for _, instr := range block.Instrs {
-			if deferInstr, ok := instr.(*ssa.Defer); ok {
-				call := deferInstr.Call
-				if call.Method != nil {
-					methodName := call.Method.Name()
-					if methodName == "Close" || methodName == "Stop" {
-						// Mark the value being closed as deferred
-						if call.Value != nil {
-							deferredVars[call.Value] = true
-							// If it's a load, mark the address too
-							if unop, ok := call.Value.(*ssa.UnOp); ok {
-								deferredVars[unop.X] = true
+			// Check if this instruction produces a Spanner type value
+			if val, ok := instr.(ssa.Value); ok {
+				typeName := getSpannerType(val.Type(), spannerTypes)
+				if typeName != "" {
+					// Skip ReadOnlyTransaction from Single() - it auto-releases
+					if typeName == "ReadOnlyTransaction" && isFromSingle(val) {
+						continue
+					}
+
+					// Found a Spanner resource - check if it has a deferred Close/Stop
+					if !hasDeferredClose(val) {
+						// Get the position - for Extract, use the tuple call's position
+						pos := val.Pos()
+						if extract, ok := val.(*ssa.Extract); ok {
+							if extract.Tuple != nil {
+								pos = extract.Tuple.Pos()
+							}
+						}
+
+						// Check for nolint directive
+						if !hasNolintDirective(pass, pos) {
+							pass.Reportf(pos, "%s.Close() must be deferred", typeName)
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+// hasDeferredClose checks if a value has a deferred Close() or Stop() method call
+func hasDeferredClose(val ssa.Value) bool {
+	if val.Referrers() == nil {
+		return false
+	}
+
+	for _, ref := range *val.Referrers() {
+		// Check if the reference is in a defer instruction
+		if _, ok := ref.(*ssa.Defer); ok {
+			// This value is used directly in a defer
+			return true
+		}
+
+		// Check if the reference is a method call (Close/Stop) in a defer
+		if call, ok := ref.(*ssa.Call); ok {
+			if call.Common().Method != nil {
+				methodName := call.Common().Method.Name()
+				if methodName == "Close" || methodName == "Stop" {
+					// Check if this call is in a defer by looking at its referrers
+					if call.Referrers() != nil {
+						for _, callRef := range *call.Referrers() {
+							if _, ok := callRef.(*ssa.Defer); ok {
+								return true
 							}
 						}
 					}
@@ -69,34 +121,7 @@ func checkFunc(pass *analysis.Pass, fn *ssa.Function, spannerTypes map[*types.Na
 		}
 	}
 
-	// Second pass: find all Store instructions storing Spanner types
-	for _, block := range fn.Blocks {
-		for _, instr := range block.Instrs {
-			if store, ok := instr.(*ssa.Store); ok {
-				// Check what's being stored
-				typeName := ""
-
-				// Case 1: Direct call result
-				if call, ok := store.Val.(*ssa.Call); ok {
-					typeName = getSpannerType(call.Type(), spannerTypes)
-				}
-
-				// Case 2: Extract from tuple (for funcs returning (val, error))
-				if extract, ok := store.Val.(*ssa.Extract); ok {
-					typeName = getSpannerType(extract.Type(), spannerTypes)
-				}
-
-				// Case 3: Direct Spanner value
-				if typeName == "" {
-					typeName = getSpannerType(store.Val.Type(), spannerTypes)
-				}
-
-				if typeName != "" && !deferredVars[store.Addr] {
-					pass.Reportf(store.Pos(), "%s.Close() must be deferred", typeName)
-				}
-			}
-		}
-	}
+	return false
 }
 
 func getSpannerType(t types.Type, spannerTypes map[*types.Named]string) string {
@@ -113,4 +138,133 @@ func getSpannerType(t types.Type, spannerTypes map[*types.Named]string) string {
 	}
 
 	return ""
+}
+
+// isFromSingle checks if a value comes from a Client.Single() call
+func isFromSingle(val ssa.Value) bool {
+	// Direct call check
+	if call, ok := val.(*ssa.Call); ok {
+		// Check method call (for interface-based calls)
+		if call.Common().Method != nil {
+			methodName := call.Common().Method.Name()
+			if methodName == "Single" {
+				return true
+			}
+		}
+		// Check function value call (for concrete type calls)
+		if call.Common().Value != nil {
+			if call.Common().Value.Name() == "Single" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// isGeneratedFile checks if a position is in a generated file
+func isGeneratedFile(pass *analysis.Pass, pos token.Pos) bool {
+	file := pass.Fset.File(pos)
+	if file == nil {
+		return false
+	}
+
+	filename := file.Name()
+
+	// Check for common generated file patterns
+	if strings.HasSuffix(filename, ".yo.go") {
+		return true
+	}
+	if strings.HasSuffix(filename, ".pb.go") {
+		return true
+	}
+	if strings.HasSuffix(filename, "_gen.go") {
+		return true
+	}
+	if strings.Contains(filename, "generated") {
+		return true
+	}
+
+	// Check for file-level nolint directive
+	if hasFileLevelNolint(pass, pos) {
+		return true
+	}
+
+	return false
+}
+
+// hasFileLevelNolint checks if there's a file-level nolint directive
+func hasFileLevelNolint(pass *analysis.Pass, pos token.Pos) bool {
+	file := pass.Fset.File(pos)
+	if file == nil {
+		return false
+	}
+
+	// Look through all comment groups in the file
+	for _, f := range pass.Files {
+		// Check if this is the right file
+		if pass.Fset.File(f.Pos()) != file {
+			continue
+		}
+
+		// Check all comment groups
+		for _, cg := range f.Comments {
+			// Only check comments near the top of the file (before line 10)
+			commentLine := file.Line(cg.Pos())
+			if commentLine > 10 {
+				break
+			}
+
+			for _, c := range cg.List {
+				text := c.Text
+				// Check for nolint directives
+				if strings.Contains(text, "nolint:spannerclosecheck") ||
+					strings.Contains(text, "nolint:all") {
+					return true
+				}
+			}
+		}
+	}
+
+	return false
+}
+
+// hasNolintDirective checks if there's a nolint comment for this position
+func hasNolintDirective(pass *analysis.Pass, pos token.Pos) bool {
+	// Get the file and position
+	file := pass.Fset.File(pos)
+	if file == nil {
+		return false
+	}
+
+	// Find the line containing this position
+	line := file.Line(pos)
+
+	// Look through all comment groups in the file
+	for _, f := range pass.Files {
+		// Check if this is the right file
+		if pass.Fset.File(f.Pos()) != file {
+			continue
+		}
+
+		// Check all comment groups
+		for _, cg := range f.Comments {
+			commentLine := file.Line(cg.Pos())
+
+			// Check if comment is on the same line or the line before
+			if commentLine == line || commentLine == line-1 {
+				for _, c := range cg.List {
+					text := c.Text
+					// Check for nolint directives
+					// Supports: //nolint:spannerclosecheck, //nolint:all, //nolint
+					if strings.Contains(text, "nolint:spannerclosecheck") ||
+						strings.Contains(text, "nolint:all") ||
+						(strings.Contains(text, "nolint") && !strings.Contains(text, ":")) {
+						return true
+					}
+				}
+			}
+		}
+	}
+
+	return false
 }

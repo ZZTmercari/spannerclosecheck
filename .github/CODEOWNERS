@@ -1,0 +1,12 @@
+# Code owners for spannerclosecheck
+# These users will be automatically requested for review when PRs are opened
+
+# Global owners - own everything unless a more specific rule below matches
+* @ZZTmercari
+
+# Analyzer core logic
+/pkg/analyzer/ @ZZTmercari
+
+# Documentation
+/README.md @ZZTmercari
+/docs/ @ZZTmercari

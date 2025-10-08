@@ -69,6 +69,11 @@ func checkFunc(pass *analysis.Pass, fn *ssa.Function, spannerTypes map[*types.Na
 						continue
 					}
 
+					// Skip RowIterator that's returned from a function - caller is responsible
+					if typeName == "RowIterator" && isReturnedFromFunction(fn, val) {
+						continue
+					}
+
 					// Found a Spanner resource - check if it has a deferred Close/Stop
 					if !hasDeferredClose(val) {
 						// Get the position - for Extract, use the tuple call's position
@@ -158,6 +163,27 @@ func isFromSingle(val ssa.Value) bool {
 			}
 		}
 	}
+	return false
+}
+
+// isReturnedFromFunction checks if a value is returned from the function
+func isReturnedFromFunction(fn *ssa.Function, val ssa.Value) bool {
+	if val.Referrers() == nil {
+		return false
+	}
+
+	for _, ref := range *val.Referrers() {
+		// Check if the value is used in a Return instruction
+		if ret, ok := ref.(*ssa.Return); ok {
+			// Check if val is one of the return values
+			for _, result := range ret.Results {
+				if result == val {
+					return true
+				}
+			}
+		}
+	}
+
 	return false
 }
 

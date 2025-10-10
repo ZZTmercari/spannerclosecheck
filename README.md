@@ -136,7 +136,125 @@ The following Cloud Spanner types are checked:
 
 **Note:** `Client.Single()` returns a `ReadOnlyTransaction` that automatically releases its session after use, so it does not need to be closed.
 
+## Best Practices & Design Philosophy
+
+This linter enforces **strict resource management** by requiring resources to be closed in the same scope where they are created. This design choice is intentional and helps prevent common resource leak patterns.
+
+### ✅ Recommended Patterns
+
+**Pattern 1: Immediate defer after creation**
+```go
+func recommended(client *spanner.Client) {
+    txn := client.ReadOnlyTransaction()
+    defer txn.Close()  // ✅ Clear ownership and cleanup
+
+    iter := txn.Query(ctx, stmt)
+    defer iter.Stop()  // ✅ Iterator also deferred
+}
+```
+
+**Pattern 2: Early return with defer**
+```go
+func withEarlyReturn(client *spanner.Client) error {
+    txn := client.ReadOnlyTransaction()
+    defer txn.Close()  // ✅ Cleanup happens on all return paths
+
+    if err := validate(); err != nil {
+        return err  // txn.Close() still called
+    }
+    return txn.Query(ctx, stmt)
+}
+```
+
+**Pattern 3: Single() for quick reads (no defer needed)**
+```go
+func quickRead(client *spanner.Client) error {
+    // ✅ Single() auto-releases, but iterator still needs Stop()
+    iter := client.Single().Query(ctx, stmt)
+    defer iter.Stop()
+    return processResults(iter)
+}
+```
+
+### ⚠️ Patterns That Will Be Flagged
+
+These patterns are intentionally flagged to encourage better practices:
+
+**Anti-pattern 1: Variable reassignment**
+```go
+func unnecessaryReassignment(client *spanner.Client) {
+    txn := client.ReadOnlyTransaction()
+    myTxn := txn  // ⚠️ Flagged: Adds unnecessary indirection
+    defer myTxn.Close()
+}
+```
+**Why flagged:** Reassignment makes ownership unclear. Use the original variable name or choose a better name initially.
+
+**Anti-pattern 2: Passing to helper function for cleanup**
+```go
+func closeHelper(txn *spanner.ReadOnlyTransaction) {
+    defer txn.Close()
+}
+
+func delegatingCleanup(client *spanner.Client) {
+    txn := client.ReadOnlyTransaction()  // ⚠️ Flagged
+    closeHelper(txn)  // Ownership transfer unclear
+}
+```
+**Why flagged:** Violates locality principle. The caller can't tell if the helper closes the resource. **Better approach:**
+```go
+// ✅ Caller owns and closes
+func helper(txn *spanner.ReadOnlyTransaction) error {
+    return txn.Query(ctx, stmt)  // Use but don't close
+}
+
+func caller(client *spanner.Client) error {
+    txn := client.ReadOnlyTransaction()
+    defer txn.Close()  // ✅ Caller maintains ownership
+    return helper(txn)
+}
+```
+
+**Anti-pattern 3: Struct storage (legitimate but requires nolint)**
+```go
+type Handler struct {
+    txn *spanner.ReadOnlyTransaction  // ⚠️ Flagged
+}
+
+func newHandler(client *spanner.Client) *Handler {
+    return &Handler{
+        txn: client.ReadOnlyTransaction(),  // ⚠️ Flagged
+    }
+}
+```
+**Why flagged:** Resource lifetime extends beyond function scope. While this is sometimes necessary (e.g., HTTP handlers, test fixtures), it requires careful management. Use `nolint` and ensure proper cleanup:
+```go
+type Handler struct {
+    txn *spanner.ReadOnlyTransaction  //nolint:spannerclosecheck // closed in Handler.Close()
+}
+
+func (h *Handler) Close() error {
+    return h.txn.Close()  // ✅ Explicit cleanup method
+}
+
+func processRequest(client *spanner.Client) {
+    h := &Handler{
+        txn: client.ReadOnlyTransaction(), //nolint:spannerclosecheck
+    }
+    defer h.Close()  // ✅ Still deferred at appropriate scope
+}
+```
+
 ## Suppressing Warnings
+
+Use `nolint` directives when you have a legitimate reason to deviate from the standard pattern.
+
+### When to Use Nolint
+
+- **Test fixtures** using `t.Cleanup()` instead of defer
+- **Long-lived resources** in structs with explicit cleanup methods
+- **Complex lifecycle management** patterns
+- **Framework integration** where cleanup is handled by the framework
 
 ### Inline nolint
 
@@ -144,8 +262,8 @@ Add a comment on the same line or the line before the flagged code:
 
 ```go
 func example(client *spanner.Client) {
-    txn := client.ReadOnlyTransaction() //nolint:spannerclosecheck
-    // Use txn with t.Cleanup or other cleanup mechanism
+    txn := client.ReadOnlyTransaction() //nolint:spannerclosecheck // closed in t.Cleanup()
+    t.Cleanup(func() { txn.Close() })
 }
 ```
 
@@ -174,6 +292,14 @@ The analyzer automatically skips these file patterns:
 - `*.pb.go` - Protocol buffer generated files
 - `*_gen.go` - General generated files
 - Files with `generated` in the path
+
+## Troubleshooting
+
+Having issues with false positives or unexpected warnings? Check out our comprehensive [Troubleshooting Guide](docs/TROUBLESHOOTING.md) which covers:
+- Common scenarios and solutions
+- When to use `nolint` directives
+- Understanding warning messages
+- Debugging tips and best practices
 
 ## Integration with golangci-lint
 
@@ -230,10 +356,14 @@ make build
 ```
 spannerclosecheck/
 ├── pkg/analyzer/        # Core analyzer logic
-│   ├── analyzer.go      # Main analyzer definition
-│   ├── defer_only.go    # Defer-only mode implementation
+│   ├── analyzer.go      # Main analyzer definition and constants
+│   ├── defer_only.go    # Defer-only mode implementation (main logic)
+│   ├── error.go         # Unified error messages and resource types
 │   ├── analyzer_test.go # Tests
 │   └── testdata/        # Test fixtures
+├── docs/                # Documentation
+│   ├── TROUBLESHOOTING.md  # Common issues and solutions
+│   └── ssa_examples.md     # SSA internals and examples
 ├── main.go              # CLI entry point
 ├── Makefile             # Build automation
 └── README.md            # Documentation

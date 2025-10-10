@@ -21,7 +21,7 @@ func badRowIteratorNoDefer(client *spanner.Client) {
 	ctx := context.Background()
 	txn := client.ReadOnlyTransaction() // want "ReadOnlyTransaction\\.Close\\(\\) must be deferred"
 
-	iter := txn.Query(ctx, spanner.Statement{}) // want "RowIterator\\.Close\\(\\) must be deferred"
+	iter := txn.Query(ctx, spanner.Statement{}) // want "RowIterator\\.Stop\\(\\) must be deferred"
 	_ = iter
 }
 
@@ -29,7 +29,7 @@ func badRowIteratorStopNotDeferred(client *spanner.Client) {
 	ctx := context.Background()
 	txn := client.ReadOnlyTransaction() // want "ReadOnlyTransaction\\.Close\\(\\) must be deferred"
 
-	iter := txn.Query(ctx, spanner.Statement{}) // want "RowIterator\\.Close\\(\\) must be deferred"
+	iter := txn.Query(ctx, spanner.Statement{}) // want "RowIterator\\.Stop\\(\\) must be deferred"
 	iter.Stop() // Stop is called but not deferred
 }
 
@@ -46,6 +46,6 @@ func badRowIteratorReadNoDefer(client *spanner.Client) {
 	ctx := context.Background()
 	txn := client.ReadOnlyTransaction() // want "ReadOnlyTransaction\\.Close\\(\\) must be deferred"
 
-	iter := txn.Read(ctx, "table", nil, []string{"col1", "col2"}) // want "RowIterator\\.Close\\(\\) must be deferred"
+	iter := txn.Read(ctx, "table", nil, []string{"col1", "col2"}) // want "RowIterator\\.Stop\\(\\) must be deferred"
 	_ = iter
 }

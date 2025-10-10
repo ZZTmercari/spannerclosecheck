@@ -18,10 +18,10 @@ func deferOnlyAnalyzer(pass *analysis.Pass) (interface{}, error) {
 
 	// Find Spanner package and register types
 	for _, pkg := range pssa.Pkg.Prog.AllPackages() {
-		if pkg.Pkg.Path() == "cloud.google.com/go/spanner" {
-			registerType(pkg, "ReadOnlyTransaction", spannerTypes)
-			registerType(pkg, "BatchReadOnlyTransaction", spannerTypes)
-			registerType(pkg, "RowIterator", spannerTypes)
+		if pkg.Pkg.Path() == pathGoogleSpanner {
+			registerType(pkg, typeNameReadOnlyTransaction, spannerTypes)
+			registerType(pkg, typeNameBatchReadOnlyTransaction, spannerTypes)
+			registerType(pkg, typeNameRowIterator, spannerTypes)
 			break
 		}
 	}
@@ -64,13 +64,19 @@ func checkFunc(pass *analysis.Pass, fn *ssa.Function, spannerTypes map[*types.Na
 			if val, ok := instr.(ssa.Value); ok {
 				typeName := getSpannerType(val.Type(), spannerTypes)
 				if typeName != "" {
+					// Only check resource creation instructions, not loads/uses
+					// Skip UnOp (loads from variables) - we only want to check the allocation
+					if _, isUnOp := val.(*ssa.UnOp); isUnOp {
+						continue
+					}
+
 					// Skip ReadOnlyTransaction from Single() - it auto-releases
-					if typeName == "ReadOnlyTransaction" && isFromSingle(val) {
+					if typeName == typeNameReadOnlyTransaction && isFromSingle(val) {
 						continue
 					}
 
 					// Skip RowIterator that's returned from a function - caller is responsible
-					if typeName == "RowIterator" && isReturnedFromFunction(fn, val) {
+					if typeName == typeNameRowIterator && isReturnedFromFunction(fn, val) {
 						continue
 					}
 
@@ -86,7 +92,10 @@ func checkFunc(pass *analysis.Pass, fn *ssa.Function, spannerTypes map[*types.Na
 
 						// Check for nolint directive
 						if !hasNolintDirective(pass, pos) {
-							pass.Reportf(pos, "%s.Close() must be deferred", typeName)
+							// Use unified error message from error.go
+							if rt, ok := spannerResourceTypes[typeName]; ok {
+								pass.Reportf(pos, "%s", rt.CloseMessage())
+							}
 						}
 					}
 				}
@@ -96,6 +105,13 @@ func checkFunc(pass *analysis.Pass, fn *ssa.Function, spannerTypes map[*types.Na
 }
 
 // hasDeferredClose checks if a value has a deferred Close() or Stop() method call
+// now only detects the close is called directly for the same variable
+// Cases will be alarmed, even if being closed:
+// Case 1: Variable reassignment before defer. Its not recommended to add unnecessary indirection.
+// Case 2: Stored in struct (an TODO item Add Heuristics for Common Patterns (Future Enhancement))
+// Case 3: Passed to helper function. This is anti-pattern since it violates locality principle.
+// Passing without closing (or closed somewhere inside helper function) is 1. Hard to track ownership, 2. Caller doesn't know if callee closes it, 3. Fragile - callee changes break caller
+// Better to : A.Caller owns and closes or B.Helper creates and manages its own
 func hasDeferredClose(val ssa.Value) bool {
 	if val.Referrers() == nil {
 		return false
@@ -112,7 +128,7 @@ func hasDeferredClose(val ssa.Value) bool {
 		if call, ok := ref.(*ssa.Call); ok {
 			if call.Common().Method != nil {
 				methodName := call.Common().Method.Name()
-				if methodName == "Close" || methodName == "Stop" {
+				if methodName == methodNameClose || methodName == methodNameStop {
 					// Check if this call is in a defer by looking at its referrers
 					if call.Referrers() != nil {
 						for _, callRef := range *call.Referrers() {
@@ -152,13 +168,13 @@ func isFromSingle(val ssa.Value) bool {
 		// Check method call (for interface-based calls)
 		if call.Common().Method != nil {
 			methodName := call.Common().Method.Name()
-			if methodName == "Single" {
+			if methodName == methodNameSingle {
 				return true
 			}
 		}
 		// Check function value call (for concrete type calls)
 		if call.Common().Value != nil {
-			if call.Common().Value.Name() == "Single" {
+			if call.Common().Value.Name() == methodNameSingle {
 				return true
 			}
 		}
@@ -243,8 +259,8 @@ func hasFileLevelNolint(pass *analysis.Pass, pos token.Pos) bool {
 			for _, c := range cg.List {
 				text := c.Text
 				// Check for nolint directives
-				if strings.Contains(text, "nolint:spannerclosecheck") ||
-					strings.Contains(text, "nolint:all") {
+				if strings.Contains(text, nolintSpanner) ||
+					strings.Contains(text, nolintAll) {
 					return true
 				}
 			}
@@ -282,9 +298,9 @@ func hasNolintDirective(pass *analysis.Pass, pos token.Pos) bool {
 					text := c.Text
 					// Check for nolint directives
 					// Supports: //nolint:spannerclosecheck, //nolint:all, //nolint
-					if strings.Contains(text, "nolint:spannerclosecheck") ||
-						strings.Contains(text, "nolint:all") ||
-						(strings.Contains(text, "nolint") && !strings.Contains(text, ":")) {
+					if strings.Contains(text, nolintAll) ||
+						strings.Contains(text, nolintSpanner) ||
+						(strings.Contains(text, nolintPrefix) && !strings.Contains(text, ":")) {
 						return true
 					}
 				}

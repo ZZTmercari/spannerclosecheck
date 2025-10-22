@@ -1,6 +1,7 @@
 package analyzer
 
 import (
+	"go/ast"
 	"go/token"
 	"go/types"
 	"strings"
@@ -57,6 +58,9 @@ func checkFunc(pass *analysis.Pass, fn *ssa.Function, spannerTypes map[*types.Na
 		return
 	}
 
+	// First pass: collect all source positions that have deferred Close/Stop at the source level
+	deferredSourcePositions := collectDeferredSourcePositions(pass, fn)
+
 	// Check all instructions for Spanner resource allocations
 	for _, block := range fn.Blocks {
 		for _, instr := range block.Instrs {
@@ -81,7 +85,8 @@ func checkFunc(pass *analysis.Pass, fn *ssa.Function, spannerTypes map[*types.Na
 					}
 
 					// Found a Spanner resource - check if it has a deferred Close/Stop
-					if !hasDeferredClose(val) {
+					// Either the value itself or stored in a variable that has defer at source level
+					if !hasDeferredClose(val) && !hasSourceLevelDefer(pass, val, deferredSourcePositions) {
 						// Get the position - for Extract, use the tuple call's position
 						pos := val.Pos()
 						if extract, ok := val.(*ssa.Extract); ok {
@@ -102,6 +107,113 @@ func checkFunc(pass *analysis.Pass, fn *ssa.Function, spannerTypes map[*types.Na
 			}
 		}
 	}
+}
+
+// collectDeferredSourcePositions collects variable names that have deferred Close/Stop in the source code
+func collectDeferredSourcePositions(pass *analysis.Pass, fn *ssa.Function) map[string]bool {
+	deferredVarNames := make(map[string]bool)
+
+	// Get the file for this function
+	file := pass.Fset.File(fn.Pos())
+	if file == nil {
+		return deferredVarNames
+	}
+
+	// Find the AST file
+	var astFile *ast.File
+	for _, f := range pass.Files {
+		if pass.Fset.File(f.Pos()) == file {
+			astFile = f
+			break
+		}
+	}
+
+	if astFile == nil {
+		return deferredVarNames
+	}
+
+	// Walk the AST to find defer statements with Close/Stop
+	ast.Inspect(astFile, func(n ast.Node) bool {
+		deferStmt, ok := n.(*ast.DeferStmt)
+		if !ok {
+			return true
+		}
+
+		// Check if it's a method call
+		callExpr, ok := deferStmt.Call.Fun.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+
+		// Check if the method is Close or Stop
+		methodName := callExpr.Sel.Name
+		if methodName != methodNameClose && methodName != methodNameStop {
+			return true
+		}
+
+		// Get the receiver variable name
+		if ident, ok := callExpr.X.(*ast.Ident); ok {
+			deferredVarNames[ident.Name] = true
+		}
+
+		return true
+	})
+
+	return deferredVarNames
+}
+
+// hasSourceLevelDefer checks if a value is stored in a variable that has a defer at source level
+func hasSourceLevelDefer(pass *analysis.Pass, val ssa.Value, deferredVarNames map[string]bool) bool {
+	if val.Referrers() == nil {
+		return false
+	}
+
+	// Get the source file
+	file := pass.Fset.File(val.Pos())
+	if file == nil {
+		return false
+	}
+
+	// Find the AST file
+	var astFile *ast.File
+	for _, f := range pass.Files {
+		if pass.Fset.File(f.Pos()) == file {
+			astFile = f
+			break
+		}
+	}
+
+	if astFile == nil {
+		return false
+	}
+
+	// Get the line number of the value
+	valLine := file.Line(val.Pos())
+
+	// Find the variable name at this line in the AST
+	var varName string
+	ast.Inspect(astFile, func(n ast.Node) bool {
+		// Look for assignment statements
+		if assignStmt, ok := n.(*ast.AssignStmt); ok {
+			assignLine := file.Line(assignStmt.Pos())
+			if assignLine == valLine {
+				// Get the LHS variable name
+				for _, lhs := range assignStmt.Lhs {
+					if ident, ok := lhs.(*ast.Ident); ok {
+						varName = ident.Name
+						return false
+					}
+				}
+			}
+		}
+		return true
+	})
+
+	if varName != "" && deferredVarNames[varName] {
+		return true
+	}
+
+	return false
 }
 
 // hasDeferredClose checks if a value has a deferred Close() or Stop() method call

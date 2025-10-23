@@ -1,4 +1,4 @@
-.PHONY: build test install clean lint test-verbose test-coverage help
+.PHONY: build test install clean lint test-verbose test-coverage help deps
 
 # Version information
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "v0.1.0")
@@ -9,8 +9,14 @@ LDFLAGS := -ldflags "-X main.Version=$(VERSION) -X main.BuildDate=$(BUILD_DATE) 
 # Default target
 .DEFAULT_GOAL := help
 
+# Ensure dependencies are downloaded and module is tidy
+deps:
+	@echo "Ensuring dependencies are up to date..."
+	@go mod download
+	@go mod tidy
+
 # Build the analyzer binary
-build:
+build: deps
 	@echo "Building spannerclosecheck $(VERSION)..."
 	go build $(LDFLAGS) -o spannerclosecheck .
 
@@ -44,9 +50,9 @@ clean:
 	rm -f coverage.out coverage.html
 
 # Run linter
-lint:
+lint: deps
 	@echo "Running linter..."
-	golangci-lint run
+	@golangci-lint run || (echo "Lint failed. If you see export data errors, try running 'make deps' first." && exit 1)
 
 # Run the analyzer on a specific package
 run:
@@ -56,12 +62,13 @@ run:
 # Help target
 help:
 	@echo "Available targets:"
+	@echo "  make deps           - Ensure Go module dependencies are downloaded and tidy"
 	@echo "  make build          - Build the analyzer binary to ./spannerclosecheck"
 	@echo "  make test           - Run all tests"
 	@echo "  make test-verbose   - Run all tests with verbose output"
 	@echo "  make test-coverage  - Run tests with coverage report"
 	@echo "  make install        - Install the analyzer to GOPATH/bin"
 	@echo "  make clean          - Remove build artifacts"
-	@echo "  make lint           - Run golangci-lint"
+	@echo "  make lint           - Run golangci-lint (ensures deps first)"
 	@echo "  make run            - Run the analyzer on the current project"
 	@echo "  make help           - Show this help message"

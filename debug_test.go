@@ -6,6 +6,7 @@ import (
 	"cloud.google.com/go/spanner"
 )
 
+//nolint:unused // Debug function for testing linter
 func testReassignment(client *spanner.Client) {
 	ctx := context.Background()
 	query := spanner.Statement{}
@@ -17,5 +18,5 @@ func testReassignment(client *spanner.Client) {
 
 	// Reassignment
 	rotx = client.ReadOnlyTransaction()
-	iter = rotx.Query(ctx, query)
+	iter = rotx.Query(ctx, query) //nolint:staticcheck // Intentional for testing
 }
